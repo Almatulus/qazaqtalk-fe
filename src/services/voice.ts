@@ -15,7 +15,7 @@ export async function startVoiceSession(onEvent?: (event: LiveEvent) => void) {
   let microphoneStream: MediaStream | null = null;
 
   try {
-    // Получаем микрофон
+    // Получаем доступ к микрофону
     microphoneStream = await navigator.mediaDevices.getUserMedia({
       audio: true,
     });
@@ -25,7 +25,7 @@ export async function startVoiceSession(onEvent?: (event: LiveEvent) => void) {
       peerConnection.addTrack(track, microphoneStream!);
     });
 
-    // Принимаем голос AI
+    // Принимаем аудио от AI
     peerConnection.addEventListener("track", (event) => {
       audioElement.srcObject = new MediaStream([event.track]);
 
@@ -37,11 +37,17 @@ export async function startVoiceSession(onEvent?: (event: LiveEvent) => void) {
     // Создаём канал событий
     const dataChannel = peerConnection.createDataChannel("oai-events");
 
+    // Получаем события от AI
     dataChannel.addEventListener("message", ({ data }) => {
-      const event = JSON.parse(data) as LiveEvent;
+      try {
+        const event = JSON.parse(data) as LiveEvent;
 
-      console.log("Live event:", event.type);
-      onEvent?.(event);
+        console.log("LIVE EVENT:", event);
+
+        onEvent?.(event);
+      } catch (error) {
+        console.error("Ошибка обработки Live API event:", error);
+      }
     });
 
     // Создаём SDP offer
@@ -126,38 +132,77 @@ export async function startVoiceSession(onEvent?: (event: LiveEvent) => void) {
       dataChannel,
       audioElement,
 
+      // Временно отключаем отправку звука с микрофона
+      pauseMicrophone() {
+        microphoneStream?.getAudioTracks().forEach((track) => {
+          track.enabled = false;
+        });
+      },
+
+      // Возобновляем отправку звука с микрофона
+      resumeMicrophone() {
+        microphoneStream?.getAudioTracks().forEach((track) => {
+          track.enabled = true;
+        });
+      },
+
+      // Закрываем голосовую сессию
       async stop() {
         if (dataChannel.readyState === "open") {
           await new Promise<void>((resolve) => {
-            const timeout = setTimeout(resolve, 5000);
+            const timeout = setTimeout(() => {
+              dataChannel.removeEventListener("message", handleMessage);
+              resolve();
+            }, 5000);
 
             function handleMessage({ data }: MessageEvent) {
-              const event = JSON.parse(data) as LiveEvent;
+              try {
+                const event = JSON.parse(data) as LiveEvent;
 
-              if (event.type === "session.closed") {
-                clearTimeout(timeout);
-                dataChannel.removeEventListener("message", handleMessage);
-                resolve();
+                if (event.type === "session.closed") {
+                  clearTimeout(timeout);
+
+                  dataChannel.removeEventListener("message", handleMessage);
+
+                  resolve();
+                }
+              } catch (error) {
+                console.error("Ошибка обработки события закрытия:", error);
               }
             }
 
             dataChannel.addEventListener("message", handleMessage);
 
-            dataChannel.send(JSON.stringify({ type: "session.close" }));
+            dataChannel.send(
+              JSON.stringify({
+                type: "session.close",
+              }),
+            );
           });
         }
 
+        // Останавливаем микрофон
         microphoneStream?.getTracks().forEach((track) => track.stop());
 
-        dataChannel.close();
+        // Закрываем канал и WebRTC
+        if (dataChannel.readyState !== "closed") {
+          dataChannel.close();
+        }
+
         peerConnection.close();
+
+        // Отключаем аудио
+        audioElement.pause();
         audioElement.srcObject = null;
       },
     };
   } catch (error) {
+    // Очистка при ошибке создания сессии
     microphoneStream?.getTracks().forEach((track) => track.stop());
 
     peerConnection.close();
+
+    audioElement.pause();
     audioElement.srcObject = null;
 
     throw error;

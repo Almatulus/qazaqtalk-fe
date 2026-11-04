@@ -1,50 +1,204 @@
 <script setup lang="ts">
 import { ref, onUnmounted } from "vue";
-import { startVoiceSession, type LiveEvent } from "../services/voice";
+import { startVoiceSession } from "../services/voice";
+import { freedomSpeech } from "../services/freedomSpeech";
 
 type VoiceSession = Awaited<ReturnType<typeof startVoiceSession>>;
 
 const isConnecting = ref(false);
 const isActive = ref(false);
+const isSpeaking = ref(false);
+
 const status = ref("Готов к разговору");
 const caption = ref("");
 const captionSpeaker = ref("");
 
 let voiceSession: VoiceSession | null = null;
 
-function handleVoiceEvent(event: LiveEvent) {
+let responseBuffer = "";
+let responseTimer: ReturnType<typeof setTimeout> | null = null;
+
+// Если GPT перестал присылать текст на 900 мс,
+// отправляем накопленный фрагмент в TTS.
+const RESPONSE_PAUSE = 900;
+
+// Количество ожидающих задач озвучивания.
+let pendingSpeechCount = 0;
+
+// Последовательная очередь озвучивания.
+let speechQueue: Promise<void> = Promise.resolve();
+
+function clearResponseTimer() {
+  if (responseTimer) {
+    clearTimeout(responseTimer);
+    responseTimer = null;
+  }
+}
+
+function updateSpeakingState() {
+  isSpeaking.value = pendingSpeechCount > 0;
+}
+
+// Извлекаем из буфера законченные предложения.
+function extractCompletePhrases(): string[] {
+  const phrases: string[] = [];
+
+  // Знаки, по которым разделяем текст на предложения.
+  const punctuation = /[.!?。！？\n]/u;
+
+  while (true) {
+    const match = punctuation.exec(responseBuffer);
+
+    if (!match || match.index === undefined) {
+      break;
+    }
+
+    const endIndex = match.index + match[0].length;
+
+    const phrase = responseBuffer.slice(0, endIndex).trim();
+
+    if (phrase) {
+      phrases.push(phrase);
+    }
+
+    responseBuffer = responseBuffer.slice(endIndex).trimStart();
+  }
+
+  return phrases;
+}
+
+// Добавляем текст в очередь озвучивания.
+function enqueueSpeech(text: string) {
+  if (!text.trim()) return;
+
+  pendingSpeechCount++;
+  updateSpeakingState();
+
+  // Не слушаем собственную озвучку через микрофон.
+  voiceSession?.pauseMicrophone();
+
+  speechQueue = speechQueue
+    .then(async () => {
+      if (!isActive.value || !voiceSession) return;
+
+      status.value = "Озвучиваю ответ...";
+
+      console.log("FREEDOMSPEECH START:", text);
+
+      await freedomSpeech.synthesize(text);
+
+      console.log("FREEDOMSPEECH FINISHED:", text);
+    })
+    .catch((error) => {
+      console.error("FreedomSpeech playback error:", error);
+      status.value = "Ошибка воспроизведения";
+    })
+    .finally(() => {
+      pendingSpeechCount = Math.max(0, pendingSpeechCount - 1);
+
+      updateSpeakingState();
+
+      // Возвращаем микрофон, когда вся очередь закончилась.
+      if (pendingSpeechCount === 0 && voiceSession && isActive.value) {
+        voiceSession.resumeMicrophone();
+        status.value = "Слушаю тебя, братан";
+      }
+    });
+}
+
+// Отправляем оставшийся текст в TTS.
+function flushResponseBuffer() {
+  clearResponseTimer();
+
+  const text = responseBuffer.trim();
+  responseBuffer = "";
+
+  if (!text || !voiceSession || !isActive.value) return;
+
+  console.log("TTS BUFFER FLUSH:", text);
+
+  enqueueSpeech(text);
+}
+
+// Обрабатываем события OpenAI Realtime.
+function handleVoiceEvent(event: any) {
   switch (event.type) {
-    case "session.started":
+    case "session.started": {
       isConnecting.value = false;
       isActive.value = true;
       status.value = "Слушаю тебя, братан";
       break;
+    }
 
-    case "session.input_transcript.delta":
-      captionSpeaker.value = "ТЫ";
+    case "session.input_transcript.delta": {
+      captionSpeaker.value = "user";
       caption.value += event.delta ?? "";
-      status.value = "Слушаю тебя, братан";
       break;
+    }
 
-    case "session.output_transcript.delta":
-      if (captionSpeaker.value !== "QAZAQTALK") {
-        caption.value = "";
+    case "session.output_transcript.delta": {
+      const delta = event.delta ?? "";
+
+      captionSpeaker.value = "assistant";
+      caption.value += delta;
+
+      // Добавляем новую часть текста в буфер.
+      responseBuffer += delta;
+
+      // Проверяем, появилось ли законченное предложение.
+      const phrases = extractCompletePhrases();
+
+      // Каждое готовое предложение сразу отправляем в TTS.
+      for (const phrase of phrases) {
+        console.log("TTS PHRASE READY:", phrase);
+        enqueueSpeech(phrase);
       }
 
-      captionSpeaker.value = "QAZAQTALK";
-      caption.value += event.delta ?? "";
-      status.value = "Базарю, слушай";
-      break;
+      // Если остался незаконченный фрагмент,
+      // ждём небольшую паузу и отправляем его.
+      clearResponseTimer();
 
-    case "session.closed":
+      if (responseBuffer.trim()) {
+        responseTimer = setTimeout(() => {
+          flushResponseBuffer();
+        }, RESPONSE_PAUSE);
+      }
+
+      // Не перезаписываем статус, если TTS уже говорит.
+      if (pendingSpeechCount === 0) {
+        status.value = "Готовлю ответ...";
+      }
+
+      break;
+    }
+
+    // Если OpenAI сообщил, что текст ответа закончен,
+    // отправляем остаток буфера без дополнительного ожидания.
+    case "session.output_transcript.done": {
+      flushResponseBuffer();
+      break;
+    }
+
+    case "session.closed": {
+      clearResponseTimer();
+      responseBuffer = "";
+
       isActive.value = false;
+      isConnecting.value = false;
+      isSpeaking.value = false;
+      pendingSpeechCount = 0;
+
+      freedomSpeech.disconnect();
+
       status.value = "Разговор завершён";
       break;
+    }
 
-    case "error":
-      console.error("GPT-Live error:", event);
-      status.value = "Произошла ошибка";
+    case "error": {
+      console.error("Voice session error:", event);
+      status.value = "Ошибка голосовой сессии";
       break;
+    }
   }
 }
 
@@ -52,48 +206,85 @@ async function startVoice() {
   if (isConnecting.value || isActive.value) return;
 
   isConnecting.value = true;
-  status.value = "Подключаемся к QazaqTalk...";
-  caption.value = "";
-  captionSpeaker.value = "";
+  status.value = "Подключаюсь...";
 
   try {
+    console.log("1. Подключаем FreedomSpeech...");
+
+    await freedomSpeech.connect();
+
+    console.log("2. FreedomSpeech подключён");
+
+    console.log("3. Запускаем OpenAI Voice Session...");
+
     voiceSession = await startVoiceSession(handleVoiceEvent);
+
+    console.log("4. OpenAI Voice Session запущена");
+
+    voiceSession.audioElement.muted = true;
+    voiceSession.audioElement.volume = 0;
 
     isConnecting.value = false;
     isActive.value = true;
     status.value = "Слушаю тебя, братан";
   } catch (error) {
-    console.error("Voice connection error:", error);
+    console.error("Ошибка запуска:", error);
 
-    status.value =
-      error instanceof Error ? error.message : "Не удалось подключиться";
+    console.error(
+      "Тип ошибки:",
+      error instanceof Error ? error.name : typeof error,
+    );
+
+    console.error("Сообщение:", error instanceof Error ? error.message : error);
+
+    freedomSpeech.disconnect();
+
+    voiceSession = null;
 
     isConnecting.value = false;
     isActive.value = false;
-    voiceSession = null;
+
+    status.value = "Не удалось подключиться";
   }
 }
 
 async function stopVoice() {
   if (!voiceSession) return;
 
-  status.value = "Завершаем разговор...";
+  clearResponseTimer();
+  responseBuffer = "";
+
+  status.value = "Завершаю разговор...";
 
   const session = voiceSession;
   voiceSession = null;
 
+  isActive.value = false;
+  isSpeaking.value = false;
+  pendingSpeechCount = 0;
+
   try {
     await session.stop();
   } catch (error) {
-    console.error("Voice stop error:", error);
+    console.error("Ошибка остановки голосовой сессии:", error);
   } finally {
-    isActive.value = false;
+    freedomSpeech.disconnect();
+
     isConnecting.value = false;
     status.value = "Разговор завершён";
   }
 }
 
 onUnmounted(() => {
+  clearResponseTimer();
+  responseBuffer = "";
+
+  isActive.value = false;
+  isSpeaking.value = false;
+  pendingSpeechCount = 0;
+
+  freedomSpeech.disconnect();
+
   if (voiceSession) {
     void voiceSession.stop();
     voiceSession = null;
@@ -104,7 +295,6 @@ onUnmounted(() => {
 <template>
   <main class="voice-page">
     <div class="voice-layout">
-      <!-- Header -->
       <header class="voice-header">
         <div class="brand">
           <div class="brand-icon">Q</div>
@@ -121,7 +311,6 @@ onUnmounted(() => {
         </div>
       </header>
 
-      <!-- Main -->
       <section class="voice-main">
         <div class="greeting">
           <span class="greeting-label">QAZAQTALK AI</span>
@@ -134,7 +323,6 @@ onUnmounted(() => {
           <p>Готов подтянуть твой казахский? Давай побазарим!</p>
         </div>
 
-        <!-- Animated sphere -->
         <div
           class="orb-container"
           :class="{
@@ -166,7 +354,6 @@ onUnmounted(() => {
           </div>
         </div>
 
-        <!-- Status -->
         <div class="voice-info">
           <div class="voice-indicator">
             <span
@@ -190,17 +377,17 @@ onUnmounted(() => {
 
           <p v-else-if="isConnecting">Устанавливаем соединение...</p>
 
+          <p v-else-if="isSpeaking">Подожди, пока я закончу говорить</p>
+
           <p v-else>Можешь говорить — я тебя слушаю</p>
         </div>
 
-        <!-- Last transcript -->
         <div v-if="caption" class="caption">
           <span>{{ captionSpeaker }}</span>
           <p>{{ caption }}</p>
         </div>
       </section>
 
-      <!-- Controls -->
       <footer class="voice-footer">
         <button
           v-if="!isActive && !isConnecting"
@@ -374,8 +561,6 @@ onUnmounted(() => {
   margin: 0;
 }
 
-/* Orb */
-
 .orb-container {
   position: relative;
   width: 250px;
@@ -450,8 +635,6 @@ onUnmounted(() => {
   }
 }
 
-/* Connecting */
-
 .connecting .orb {
   animation: connecting-pulse 1s ease-in-out infinite;
 }
@@ -479,8 +662,6 @@ onUnmounted(() => {
     opacity: 0;
   }
 }
-
-/* Active conversation */
 
 .active .orb {
   animation: orb-speaking 1.5s ease-in-out infinite;
@@ -526,8 +707,6 @@ onUnmounted(() => {
   }
 }
 
-/* Status */
-
 .voice-info {
   min-height: 65px;
 }
@@ -570,8 +749,6 @@ onUnmounted(() => {
   margin-top: 10px;
 }
 
-/* Caption */
-
 .caption {
   max-width: 520px;
   width: 100%;
@@ -596,8 +773,6 @@ onUnmounted(() => {
   font-size: 14px;
   line-height: 1.6;
 }
-
-/* Controls */
 
 .voice-footer {
   flex-shrink: 0;

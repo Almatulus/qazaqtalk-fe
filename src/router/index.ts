@@ -1,5 +1,4 @@
 import { createRouter, createWebHistory } from "vue-router";
-import ChatPage from "../pages/ChatPage.vue";
 import ChatPageText from "../pages/ChatPageText.vue";
 
 const routes = [
@@ -8,11 +7,11 @@ const routes = [
     name: "home",
     component: ChatPageText,
   },
-  {
-    path: "/chat",
-    name: "chat",
-    component: ChatPage,
-  },
+  // {
+  //   path: "/chat",
+  //   name: "chat",
+  //   component: ChatPage,
+  // },
   {
     path: "/chattext",
     name: "chattext",
